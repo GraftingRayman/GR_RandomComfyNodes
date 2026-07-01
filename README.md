@@ -10,3 +10,6 @@ If you would like to support my efforts use the QR code
 
 # GRCaptionOverlay
 Create audio captions for your videos
+
+# GRLastFrame
+Outputs First, Middle and Last Frame
