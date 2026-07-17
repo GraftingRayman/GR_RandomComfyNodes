@@ -13,3 +13,6 @@ Create audio captions for your videos
 
 # GRLastFrame
 Outputs First, Middle and Last Frame
+
+# gr_tts_pause_nodes.py
+Add pauses to Qwen TTS audio
