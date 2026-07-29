@@ -16,43 +16,97 @@ class GRPromptReplacerAttributesBasic:
     Use the "randomize" checkbox and "seed" value to generate random combinations.
 
     Special Categories:
-    - Image Type: Prepended at the very start of the prompt (e.g., "A 3D render of...")
     - Photograph Type: Intelligently inserts distance/shot type with fallback (e.g., "close up photograph")
     """
 
-    # ---- IMAGE TYPE (prepended at the very start) ----------------------------
-    
-    IMAGE_TYPE_OPTIONS = [
+    # ---- HEADWEAR ------------------------------------------------------------
+    HEADWEAR_OPTIONS = [
         "none",
-        # Photorealistic
-        "photograph", "photo", "photorealistic", "photographic",
-        # 3D/CG
-        "3d render", "3d rendering", "3d image", "3d artwork", 
-        "3d model", "cgi", "computer generated", "cg art",
-        # 2D/Illustration
-        "illustration", "digital art", "digital illustration",
-        "vector art", "vector illustration", "flat illustration",
-        "2d art", "2d illustration",
-        # Traditional Media
-        "oil painting", "watercolor", "acrylic painting", "pastel",
-        "charcoal drawing", "pencil sketch", "ink drawing", "pen and ink",
-        "mixed media", "collage",
-        # Stylized
-        "cartoon", "animated", "anime", "manga", "comic", "comic book",
-        "graphic novel", "pixel art", "8-bit", "16-bit",
-        "low poly", "voxel art", "isometric", "top-down",
-        "fantasy art", "sci-fi art", "concept art", "storybook",
-        "children's book", "fairytale", "whimsical",
-        # Abstract
-        "abstract", "geometric", "minimalist", "surreal", "psychedelic",
-        "expressionist", "impressionist", "cubist", "art deco",
-        "art nouveau", "pop art", "graffiti", "street art",
-        # Photography styles
-        "film photography", "polaroid", "instant photo", "vintage photo",
-        "black and white", "monochrome", "sepia", "cyanotype",
-        "lomography", "holga", "toy camera", "pinhole"
+        "hijab", "headscarf", "head covering", "head wrap",
+        "beanie", "cap", "baseball cap", "hat", "wide-brimmed hat",
+        "cowboy hat", "sailor hat", "beret", "fedora", "headband",
+        "bandana", "headpiece", "turban", "veil",
+        # Adding more detailed options based on prompt analysis
+        "black hijab", "blue hijab", "green hijab", "brown hijab", "white hijab",
+        "pink hijab", "red hijab", "maroon hijab",
+        "beaded headpiece", "gold headpiece", "ornate headpiece",
+        "knitted beanie", "fur hat", "pink beanie", "red beanie",
     ]
-    
+    HEADWEAR_MAPPING_DEFAULT = (
+        # --- Head Coverings (Hijab/Headscarves) ---
+        "wearing a hijab, wearing a {value}\n"
+        "wearing a black hijab, wearing a {value}\n"
+        "wearing a blue hijab, wearing a {value}\n"
+        "wearing a brown hijab, wearing a {value}\n"
+        "wearing a green hijab, wearing a {value}\n"
+        "wearing a pink hijab, wearing a {value}\n"
+        "wearing a red hijab, wearing a {value}\n"
+        "wearing a white hijab, wearing a {value}\n"
+        "wearing a maroon hijab, wearing a {value}\n"
+        "black hijab,{value}\n"
+        "blue hijab,{value}\n"
+        "brown hijab,{value}\n"
+        "green hijab,{value}\n"
+        "pink hijab,{value}\n"
+        "red hijab,{value}\n"
+        "white hijab,{value}\n"
+        "maroon hijab,{value}\n"
+        "a hijab, a {value}\n"
+        "the hijab, the {value}\n"
+        "with a hijab, with a {value}\n"
+        # --- Hats & Headpieces ---
+        "wearing a hat, wearing a {value}\n"
+        "wearing a beanie, wearing a {value}\n"
+        "wearing a cap, wearing a {value}\n"
+        "wearing a baseball cap, wearing a {value}\n"
+        "wearing a cowboy hat, wearing a {value}\n"
+        "wearing a wide-brimmed hat, wearing a {value}\n"
+        "wearing a beret, wearing a {value}\n"
+        "wearing a bandana, wearing a {value}\n"
+        "wearing a headband, wearing a {value}\n"
+        "wearing a headpiece, wearing a {value}\n"
+        "wearing a gold headpiece, wearing a {value}\n"
+        "wearing a beaded headpiece, wearing a {value}\n"
+        "wearing an ornate headpiece, wearing a {value}\n"
+        "a hat, a {value}\n"
+        "the hat, the {value}\n"
+        "with a hat, with a {value}\n"
+        "beanie,{value}\n"
+        "cap,{value}\n"
+        "baseball cap,{value}\n"
+        "cowboy hat,{value}\n"
+        "wide-brimmed hat,{value}\n"
+        "beret,{value}\n"
+        "fedora,{value}\n"
+        "headband,{value}\n"
+        "bandana,{value}\n"
+        "turban,{value}\n"
+        "veil,{value}\n"
+        # --- Contextual Replacements ---
+        "headscarf,{value}\n"
+        "head wrap,{value}\n"
+        "head covering,{value}\n"
+        "headpiece,{value}\n"
+        "hair accessory,{value}\n"
+        # --- Specific Options from Prompts ---
+        "red beanie,{value}\n"
+        "pink beanie,{value}\n"
+        "knitted beanie,{value}\n"
+        "fur hat,{value}\n"
+        "sailor hat,{value}\n"
+        "black headscarf,{value}\n"
+        "blue headscarf,{value}\n"
+        "brown headscarf,{value}\n"
+        "green headscarf,{value}\n"
+        "pink headscarf,{value}\n"
+        "red headscarf,{value}\n"
+        "white headscarf,{value}\n"
+        "maroon headscarf,{value}\n"
+        "gold headpiece,{value}\n"
+        "beaded headpiece,{value}\n"
+        "ornate headpiece,{value}"
+    )
+
     # ---- PHOTOGRAPH TYPE (with intelligent fallback) ------------------------
     
     PHOTOGRAPH_TYPE_OPTIONS = [
@@ -1379,19 +1433,22 @@ class GRPromptReplacerAttributesBasic:
 
     # ---- CATEGORIES dictionary ---------------------------------------------
     CATEGORIES = {
+        "photograph_type": (PHOTOGRAPH_TYPE_OPTIONS, PHOTOGRAPH_TYPE_MAPPING_DEFAULT),
+        "setting": (SETTING_OPTIONS, SETTING_MAPPING_DEFAULT),
+        "lighting": (LIGHTING_OPTIONS, LIGHTING_MAPPING_DEFAULT),
+        "mood": (MOOD_OPTIONS, MOOD_MAPPING_DEFAULT),
+        "camera_angle": (CAMERA_ANGLE_OPTIONS, CAMERA_ANGLE_MAPPING_DEFAULT),
         "hair_color": (HAIR_COLOR_OPTIONS, HAIR_COLOR_MAPPING_DEFAULT),
         "skin_tone": (SKIN_TONE_OPTIONS, SKIN_TONE_MAPPING_DEFAULT),
         "hair_style": (HAIR_STYLE_OPTIONS, HAIR_STYLE_MAPPING_DEFAULT),
         "eye_color": (EYE_COLOR_OPTIONS, EYE_COLOR_MAPPING_DEFAULT),
         "smile": (SMILE_OPTIONS, SMILE_MAPPING_DEFAULT),
         "expression": (EXPRESSION_OPTIONS, EXPRESSION_MAPPING_DEFAULT),
-        "lighting": (LIGHTING_OPTIONS, LIGHTING_MAPPING_DEFAULT),
-        "mood": (MOOD_OPTIONS, MOOD_MAPPING_DEFAULT),
         "pose": (POSE_OPTIONS, POSE_MAPPING_DEFAULT),
+        "outfit_style": (OUTFIT_STYLE_OPTIONS, OUTFIT_STYLE_MAPPING_DEFAULT),
+        "headwear": (HEADWEAR_OPTIONS, HEADWEAR_MAPPING_DEFAULT),
         "hand_position": (HAND_POSITION_OPTIONS, HAND_POSITION_MAPPING_DEFAULT),
         "head_position": (HEAD_POSITION_OPTIONS, HEAD_POSITION_MAPPING_DEFAULT),
-        "camera_angle": (CAMERA_ANGLE_OPTIONS, CAMERA_ANGLE_MAPPING_DEFAULT),
-        "setting": (SETTING_OPTIONS, SETTING_MAPPING_DEFAULT),
         "makeup": (MAKEUP_OPTIONS, MAKEUP_MAPPING_DEFAULT),
         "jewelry": (JEWELRY_OPTIONS, JEWELRY_MAPPING_DEFAULT),
         "top_color": (TOP_COLOR_OPTIONS, TOP_COLOR_MAPPING_DEFAULT),
@@ -1400,14 +1457,10 @@ class GRPromptReplacerAttributesBasic:
         "bottom_type": (BOTTOM_TYPE_OPTIONS, BOTTOM_TYPE_MAPPING_DEFAULT),
         "footwear_color": (FOOTWEAR_COLOR_OPTIONS, FOOTWEAR_COLOR_MAPPING_DEFAULT),
         "footwear_type": (FOOTWEAR_TYPE_OPTIONS, FOOTWEAR_TYPE_MAPPING_DEFAULT),
-        "outfit_style": (OUTFIT_STYLE_OPTIONS, OUTFIT_STYLE_MAPPING_DEFAULT),
-        "photograph_type": (PHOTOGRAPH_TYPE_OPTIONS, PHOTOGRAPH_TYPE_MAPPING_DEFAULT),
-        "image_type": (IMAGE_TYPE_OPTIONS, ""),  # Empty mapping - handled specially
     }
 
     # Categories that need special handling
     SPECIAL_CATEGORIES = {
-        "image_type": "prepend",
         "photograph_type": "photograph_fallback",
     }
 
@@ -1418,7 +1471,7 @@ class GRPromptReplacerAttributesBasic:
         "head_position", "camera_angle", "setting", "makeup", "jewelry",
         "top_color", "top_type", "bottom_color", "bottom_type",
         "footwear_color", "footwear_type", "outfit_style",
-        "photograph_type", "image_type"
+        "photograph_type", "headwear",
     ]
 
     @classmethod
@@ -1427,9 +1480,7 @@ class GRPromptReplacerAttributesBasic:
         for cat_key, (options, mapping_default) in cls.CATEGORIES.items():
             label = cat_key.replace("_", " ").title()
             tooltip = None
-            if cat_key == "image_type":
-                tooltip = "Prepended at the start of the prompt (e.g., 'A 3D render of...')"
-            elif cat_key == "photograph_type":
+            if cat_key == "photograph_type":
                 tooltip = "Intelligently inserts distance/shot type (e.g., 'close up photograph')"
             
             optional[cat_key] = (options, {
@@ -1493,84 +1544,6 @@ class GRPromptReplacerAttributesBasic:
     CATEGORY = "GR Utilities"
 
     # ---- Helper methods for special categories --------------------------------
-
-    def apply_image_type_prepend(self, text, image_type_value, preserve_case=True):
-        """
-        Prepend the image type at the very start of the prompt with proper grammar.
-        Handles: "a 3d render", "an oil painting", "a photograph", etc.
-        """
-        if not text or not image_type_value or image_type_value == "none":
-            return text, []
-
-        changes = []
-        
-        # Determine the appropriate indefinite article if needed
-        words = image_type_value.split()
-        
-        # Check if the value already starts with an article
-        if words and words[0].lower() in ['a', 'an', 'the']:
-            prefix = image_type_value
-        else:
-            # Add appropriate article
-            first_word = image_type_value.lower()
-            if first_word[0] in 'aeiou':
-                article = 'an'
-            else:
-                article = 'a'
-            
-            # Special cases where "an" is more natural
-            if first_word in ['oil painting', 'acrylic painting', 'abstract',
-                            'illustration', 'ink drawing', 'animation']:
-                article = 'an'
-            
-            prefix = f"{article} {image_type_value}"
-        
-        # Capitalize first letter for proper sentence start
-        prefix = prefix[0].upper() + prefix[1:] if prefix else prefix
-        
-        # Find if the text already starts with "a", "an", or "the" followed by something
-        text_lower = text.lower()
-        
-        # Patterns that indicate the prompt starts with a description
-        patterns = [
-            (r'^(a|an|the)\s+', 'article'),
-            (r'^(photograph|photo|image|picture|drawing|painting)\s+', 'noun'),
-        ]
-        
-        matched = False
-        pos = 0
-        
-        for pattern, _ in patterns:
-            match = re.match(pattern, text_lower)
-            if match:
-                matched = True
-                pos = match.end()
-                break
-        
-        if matched:
-            # Insert after the article/noun
-            new_text = text[:pos] + prefix + " " + text[pos:]
-            
-            changes.append({
-                'old': text[:pos],
-                'new': text[:pos] + prefix + " ",
-                'start': 0,
-                'end': pos,
-                'rule_used': f"Prepend image type: {prefix}"
-            })
-            return new_text, changes
-        else:
-            # Prepend to the very beginning
-            new_text = prefix + " " + text
-            
-            changes.append({
-                'old': '',
-                'new': prefix + " ",
-                'start': 0,
-                'end': 0,
-                'rule_used': f"Prepend image type: {prefix}"
-            })
-            return new_text, changes
 
     def apply_photograph_type_fallback(self, text, photograph_type_value, preserve_case=True):
         """
@@ -2055,17 +2028,6 @@ class GRPromptReplacerAttributesBasic:
         # First, handle special categories that need custom processing
         all_changes = []
         result_text = text
-
-        # Process image type (prepend)
-        image_type_value = kwargs.get('image_type', 'none')
-        if randomize and image_type_value == 'none':
-            image_type_value = self.get_random_value('image_type', random.Random(seed) if seed else random.Random())
-        
-        if image_type_value != 'none':
-            result_text, image_changes = self.apply_image_type_prepend(
-                result_text, image_type_value, preserve_case
-            )
-            all_changes.extend(image_changes)
 
         # Process photograph type (fallback insertion)
         photograph_type_value = kwargs.get('photograph_type', 'none')

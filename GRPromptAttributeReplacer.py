@@ -228,6 +228,105 @@ class GRPromptAttributeReplacer:
         "facial expression,{value} expression"
     )
 
+    LIGHTING_OPTIONS = [
+        "none", "soft", "bright", "natural", "warm", "dim", "even", "diffused",
+        "dramatic", "artificial", "ambient", "harsh",
+        # darker / horror-leaning values not present in the source prompts,
+        # added on request
+        "low-key", "moody", "eerie", "ominous", "sinister", "creepy",
+        "foreboding", "shadowy", "grim", "spooky", "haunting", "candlelit",
+        "flickering", "moonlit", "noir", "chiaroscuro",
+        "gothic", "cinematic", "filmic", "volumetric", "atmospheric",
+        "dreamlike", "surreal", "ethereal", "magical", "mystical", "arcane",
+        "celestial", "divine", "cyberpunk", "dystopian", "post apocalyptic",
+        "custom",
+    ]
+    LIGHTING_MAPPING_DEFAULT = (
+        # compound phrases mined from real prompts ("the lighting is X")
+        "lighting is soft and natural,lighting is {value}\n"
+        "lighting is bright and natural,lighting is {value}\n"
+        "lighting is soft and warm,lighting is {value}\n"
+        "lighting is bright and even,lighting is {value}\n"
+        "lighting is soft and even,lighting is {value}\n"
+        "lighting is even and bright,lighting is {value}\n"
+        "lighting is soft and diffused,lighting is {value}\n"
+        "lighting is even and soft,lighting is {value}\n"
+        "lighting is bright and sunny,lighting is {value}\n"
+        "lighting is natural and bright,lighting is {value}\n"
+        "lighting is soft and evenly distributed,lighting is {value}\n"
+        "lighting is even and diffuse,lighting is {value}\n"
+        "lighting is warm and soft,lighting is {value}\n"
+        "lighting is bright and evenly distributed,lighting is {value}\n"
+        "lighting is dramatic,lighting is {value}\n"
+        "lighting is dim,lighting is {value}\n"
+        "lighting is bright,lighting is {value}\n"
+        "lighting is natural,lighting is {value}\n"
+        "lighting is even,lighting is {value}\n"
+        "lighting is artificial,lighting is {value}\n"
+        # "X lighting" noun-phrase forms
+        "soft lighting,{value} lighting\n"
+        "warm lighting,{value} lighting\n"
+        "natural lighting,{value} lighting\n"
+        "dramatic lighting,{value} lighting\n"
+        "volumetric lighting,{value} lighting\n"
+        "ambient lighting,{value} lighting\n"
+        "artificial lighting,{value} lighting\n"
+        "indoor lighting,{value} lighting\n"
+        "warm ambient lighting,{value} lighting\n"
+        "soft ambient lighting,{value} lighting\n"
+        "subtle rim lighting,{value} lighting\n"
+        "high contrast lighting,{value} lighting\n"
+        "dramatic cinematic lighting,{value} lighting\n"
+        # "X light" forms
+        "natural daylight,{value} light\n"
+        "warm tungsten light,{value} light\n"
+        "cool blue light,{value} light\n"
+        # mood/style adjectives
+        "eerie,{value}\n"
+        "ominous,{value}\n"
+        "haunting,{value}\n"
+        "sinister,{value}\n"
+        "gothic,{value}\n"
+        "cinematic,{value}\n"
+        "filmic,{value}\n"
+        "volumetric,{value}\n"
+        "atmospheric,{value}\n"
+        "moody,{value}\n"
+        "dreamlike,{value}\n"
+        "surreal,{value}\n"
+        "ethereal,{value}\n"
+        "magical,{value}\n"
+        "mystical,{value}\n"
+        "arcane,{value}\n"
+        "celestial,{value}\n"
+        "divine,{value}\n"
+        "noir,{value}\n"
+        "cyberpunk,{value}\n"
+        "dystopian,{value}\n"
+        "post apocalyptic,{value}\n"
+        # "-lit" forms
+        "softly lit,{value}\n"
+        "brightly lit,{value}\n"
+        "dimly lit,{value}\n"
+        "dramatically lit,{value}\n"
+        "naturally lit,{value}\n"
+        "warmly lit,{value}\n"
+        "coolly lit,{value}\n"
+        "backlit,{value}\n"
+        "front lit,{value}\n"
+        "side lit,{value}\n"
+        "rim lit,{value}\n"
+        "edge lit,{value}\n"
+        "top lit,{value}\n"
+        "under lit,{value}\n"
+        "candlelit,{value}\n"
+        "moonlit,{value}\n"
+        "torchlit,{value}\n"
+        "lantern lit,{value}\n"
+        "firelit,{value}\n"
+        "sunlit,{value}"
+    )
+
     # category_key -> (dropdown options, default mapping text)
     CATEGORIES = {
         "hair_color": (HAIR_COLOR_OPTIONS, HAIR_COLOR_MAPPING_DEFAULT),
@@ -236,6 +335,7 @@ class GRPromptAttributeReplacer:
         "eye_color": (EYE_COLOR_OPTIONS, EYE_COLOR_MAPPING_DEFAULT),
         "smile": (SMILE_OPTIONS, SMILE_MAPPING_DEFAULT),
         "expression": (EXPRESSION_OPTIONS, EXPRESSION_MAPPING_DEFAULT),
+        "lighting": (LIGHTING_OPTIONS, LIGHTING_MAPPING_DEFAULT),
     }
 
     @classmethod
