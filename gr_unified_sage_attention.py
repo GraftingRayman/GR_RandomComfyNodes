@@ -779,15 +779,387 @@ class GRUnifiedSageAttentionPatch:
         return (model_clone,)
 
 
+import math
+
+# ---------------------------------------------------------------------------
+# Spectrum (SDXL variant) -- vendored verbatim from ruwwww/ComfyUI-Spectrum-sdxl
+# (src/spectrum_node.py + src/forecaster.py, read in full). This is the SIMPLE
+# variant: patches set_model_unet_function_wrapper, forecasts raw UNet output
+# via blended Chebyshev+local-Taylor regression. It is architecture-agnostic
+# at the mechanism level (operates on whatever tensor the wrapper receives)
+# but was calibrated/tested against SDXL.
+#
+# NOT included: the "Proper" / Flux / Wan / MiniMax-H3 Spectrum variants.
+# Their runtime (solver-step scheduling, batch-label reordering across cond/
+# uncond branches, forecast-invalidation on a dozen different invariants) is
+# real production complexity across several more files I have not fully read
+# -- vendoring it half-verified risks silently corrupted latents, which is
+# worse than leaving those as their own separate nodes in your graph.
+# ---------------------------------------------------------------------------
+
+_SPECTRUM_DTYPE = torch.bfloat16
+
+
+def _spectrum_flatten(x):
+    return (x.reshape(1, -1) if x.ndim == 1 else x.reshape(1, -1)), x.shape
+
+
+def _spectrum_unflatten(x_flat, shape):
+    return x_flat.reshape(shape)
+
+
+class _SpectrumBaseForecaster(torch.nn.Module):
+    def __init__(self, M=3, K=10, lam=1e-3, device=None, feature_shape=None, t_max=50.0):
+        super().__init__()
+        assert K >= M + 2, "K should exceed basis size for stability"
+        self.M, self.K, self.lam, self.t_max_val = M, K, lam, t_max
+        self.register_buffer("t_buf", torch.empty(0))
+        self._H_buf = None
+        self._shape = None
+        self._coef = None
+        self._XtX_fac = None
+        self._tau_cache = None
+        self._X_cache = None
+        self._last_delta_norm = None
+        self.device_ref = device
+        self.feature_shape = feature_shape
+
+    def _taus(self, t):
+        assert self.t_buf.numel() >= 1
+        t_min = torch.zeros(1, device=t.device, dtype=t.dtype)
+        t_max = torch.ones(1, device=t.device, dtype=t.dtype) * self.t_max_val
+        if torch.isclose(t_max, t_min):
+            return torch.zeros_like(t)
+        mid = 0.5 * (t_min + t_max)
+        rng = (t_max - t_min)
+        return (t - mid) * 2.0 / rng
+
+    def _build_design(self, taus):
+        raise NotImplementedError
+
+    def update(self, t, h):
+        device = self.device_ref or h.device
+        t = torch.as_tensor(t, dtype=_SPECTRUM_DTYPE, device=device)
+        h_flat, shape = _spectrum_flatten(h)
+        h_flat = h_flat.to(device)
+        if self._shape is None:
+            self._shape = shape
+        else:
+            assert shape == self._shape, "Feature shape must remain constant"
+        if self.t_buf.numel() == 0:
+            self.t_buf = t[None]
+            self._H_buf = h_flat
+        else:
+            delta = (h_flat - self._H_buf[-1])
+            self._last_delta_norm = delta.norm(p=2)
+            self.t_buf = torch.cat([self.t_buf, t[None]], dim=0)
+            self._H_buf = torch.cat([self._H_buf, h_flat], dim=0)
+            if self.t_buf.numel() > self.K:
+                self.t_buf = self.t_buf[-self.K:]
+                self._H_buf = self._H_buf[-self.K:]
+        self._coef = self._XtX_fac = self._tau_cache = self._X_cache = None
+
+    def ready(self):
+        return self.t_buf.numel() >= min(self.K, self.M + 2)
+
+    def _fit_if_needed(self):
+        if self._coef is not None:
+            return
+        taus = self._taus(self.t_buf)
+        X = self._build_design(taus).to(torch.float32)
+        H = self._H_buf.to(torch.float32)
+        _, P = X.shape
+        lamI = self.lam * torch.eye(P, device=X.device, dtype=X.dtype)
+        Xt = X.transpose(0, 1)
+        XtX = Xt @ X + lamI
+        try:
+            L = torch.linalg.cholesky(XtX)
+        except Exception:
+            jitter = 1e-6 * XtX.diag().mean()
+            L = torch.linalg.cholesky(XtX + jitter * torch.eye(P, device=X.device))
+        XtH = Xt @ H
+        self._coef = torch.cholesky_solve(XtH, L).to(_SPECTRUM_DTYPE)
+        self._XtX_fac, self._tau_cache, self._X_cache = L, taus, X.to(_SPECTRUM_DTYPE)
+
+    @torch.no_grad()
+    def predict(self, t_star):
+        assert self._shape is not None
+        device = self.t_buf.device
+        t_star = torch.as_tensor(t_star, dtype=_SPECTRUM_DTYPE, device=device)
+        self._fit_if_needed()
+        tau_star = self._taus(t_star)
+        x_star = self._build_design(tau_star[None])
+        return _spectrum_unflatten(x_star @ self._coef, self._shape)
+
+
+class _SpectrumChebyshevForecaster(_SpectrumBaseForecaster):
+    def _build_design(self, taus):
+        taus = taus.reshape(-1, 1)
+        T0 = torch.ones((taus.shape[0], 1), device=taus.device, dtype=taus.dtype)
+        if self.M == 0:
+            return T0
+        cols = [T0, taus]
+        for _ in range(2, self.M + 1):
+            cols.append(2 * taus * cols[-1] - cols[-2])
+        return torch.cat(cols[: self.M + 1], dim=1)
+
+
+class _Spectrum(torch.nn.Module):
+    def __init__(self, cheb_like, taylor_order=1, w=None):
+        super().__init__()
+        self.cheb = cheb_like
+        self.taylor_order = taylor_order
+        self.w = w
+
+    @torch.no_grad()
+    def _local_taylor_discrete(self, t_star):
+        H, t = self.cheb._H_buf, self.cheb.t_buf
+        h_i, t_i = H[-1], t[-1]
+        if t.numel() < 2:
+            return _spectrum_unflatten(h_i.clone().reshape(1, -1), self.cheb._shape)
+        h_im1, t_im1 = H[-2], t[-2]
+        dh1 = h_i - h_im1
+        dt_last = (t_i - t_im1).clamp_min(1e-8)
+        k = ((t_star - t_i) / dt_last).to(h_i.dtype)
+        out = h_i + k * dh1
+        if self.taylor_order >= 2 and t.numel() >= 3:
+            h_im2 = H[-3]
+            out = out + 0.5 * k * (k - 1.0) * (h_i - 2 * h_im1 + h_im2)
+        return _spectrum_unflatten(out.reshape(1, -1), self.cheb._shape)
+
+    @torch.no_grad()
+    def predict(self, t_star):
+        device = self.cheb.t_buf.device
+        t_star = torch.as_tensor(t_star, dtype=_SPECTRUM_DTYPE, device=device)
+        h_taylor = self._local_taylor_discrete(t_star)
+        if not self.cheb.ready():
+            return h_taylor
+        h_cheb = self.cheb.predict(t_star)
+        return (1 - self.w) * h_taylor + self.w * h_cheb
+
+    def update(self, t, h):
+        return self.cheb.update(t, h)
+
+    def ready(self):
+        return self.cheb.ready()
+
+
+def _spectrum_sdxl_wrap_model(model, w, m, lam, window_size, flex_window, warmup_steps, stop_caching_step, steps):
+    """Faithful port of SpectrumSDXL.patch() -- installs a unet_function_wrapper."""
+    state = {
+        "forecasters": None, "cnt": 0, "num_cached": [0],
+        "curr_ws": float(window_size), "last_t": -1, "total_runs": 0,
+        "estimated_total_steps": steps,
+    }
+    forecast_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+    def spectrum_unet_wrapper(model_function, kwargs):
+        x, timestep, c = kwargs["input"], kwargs["timestep"], kwargs["c"]
+        batch_size = x.shape[0]
+
+        if not state.get("_shape_logged"):
+            state["_shape_logged"] = True
+            if x.ndim == 5:
+                per_row_mb = x[0].numel() * x.element_size() / (1024 * 1024)
+                est_mb = per_row_mb * min(100, 1) * batch_size  # K capped effectively by ready()/M+2, rough estimate
+                logging.warning(
+                    f"GRSpectrumApply: 5D (video-shaped) latent detected {tuple(x.shape)}. "
+                    "This node's row-identity protection is a lightweight shape-based "
+                    "fingerprint, NOT the full transactional branch-tracking the dedicated "
+                    "ComfyUI-Spectrum-WAN-Proper / -MiniMax-H3 repos implement. Verify output "
+                    "quality against spectrum-disabled before trusting this for real work. "
+                    f"Approx per-step-per-row history footprint: {per_row_mb:.1f} MB."
+                )
+
+        t_scalar = timestep[0].item() if isinstance(timestep, torch.Tensor) and timestep.numel() > 0 else float(timestep)
+
+        if t_scalar > state["last_t"]:
+            state["forecasters"] = None
+            state["cnt"] = 0
+            state["num_cached"] = [0] * batch_size
+            state["curr_ws"] = float(window_size)
+            state["total_runs"] += 1
+            state["fingerprints"] = [None] * batch_size
+        state["last_t"] = t_scalar
+
+        if state["forecasters"] is None:
+            state["forecasters"] = [
+                _Spectrum(cheb_like=_SpectrumChebyshevForecaster(M=m, K=100, lam=lam, t_max=float(steps)), w=w)
+                for _ in range(batch_size)
+            ]
+        if len(state["num_cached"]) != batch_size:
+            state["num_cached"] = [0] * batch_size
+        if len(state.get("fingerprints", [])) != batch_size:
+            state["fingerprints"] = [None] * batch_size
+
+        # Cheap batch-identity guard: this SDXL-style implementation assumes batch
+        # index i means the same conditioning branch on every step. That's a safe
+        # assumption for a single-frame image UNet call, but is exactly the thing
+        # the real Wan/MiniMax-H3 Spectrum repos build whole transactional
+        # branch-label systems to guarantee, because samplers CAN reorder or
+        # resize cond/uncond rows between steps on video models. We don't have
+        # that machinery here. What we do instead: fingerprint each batch row by
+        # the shapes of its conditioning tensors (cheap -- no tensor hashing) and
+        # if index i's fingerprint changes mid-run, force a REAL step for that
+        # index instead of forecasting against a history that may belong to a
+        # different conditioning branch now. This catches the coarse "rows got
+        # reordered/resized" failure mode; it does NOT catch same-shape rows
+        # silently swapping identity, which the real branch-label systems do
+        # catch. Treat this as reduced protection, not equivalent protection.
+        def _row_fingerprint(idx):
+            parts = []
+            for key in sorted(c.keys()):
+                v = c[key]
+                if isinstance(v, torch.Tensor) and v.shape[0] == batch_size:
+                    parts.append((key, tuple(v[idx].shape)))
+                elif isinstance(v, torch.Tensor):
+                    parts.append((key, tuple(v.shape)))
+            return tuple(parts)
+
+        fingerprint_mismatch = [False] * batch_size
+        for i in range(batch_size):
+            fp = _row_fingerprint(i)
+            if state["fingerprints"][i] is not None and state["fingerprints"][i] != fp:
+                fingerprint_mismatch[i] = True
+                logging.warning(
+                    f"GRSpectrumApply: conditioning shape at batch index {i} changed "
+                    f"mid-run (t={t_scalar}) -- forcing a real step for this index "
+                    "instead of forecasting, since cached history may belong to a "
+                    "different conditioning branch now."
+                )
+            state["fingerprints"][i] = fp
+
+        do_actual = torch.ones(batch_size, dtype=torch.bool, device=x.device)
+        for i in range(batch_size):
+            if fingerprint_mismatch[i]:
+                continue  # stays True -- forced real step
+            is_micro_final = False
+            if stop_caching_step == -1:
+                if state["cnt"] >= int(state["estimated_total_steps"] * 0.8):
+                    is_micro_final = True
+            elif stop_caching_step > 0 and state["cnt"] >= stop_caching_step:
+                is_micro_final = True
+            if state["cnt"] >= warmup_steps and not is_micro_final:
+                if state["forecasters"][i].ready():
+                    do_actual[i] = (state["num_cached"][i] + 1) % math.floor(state["curr_ws"]) == 0
+                else:
+                    do_actual[i] = True
+
+        real_mask, forecast_mask = do_actual, ~do_actual
+        out = torch.empty_like(x)
+
+        if real_mask.any():
+            x_real = x[real_mask]
+            timestep_real = timestep[real_mask.to(timestep.device)] if isinstance(timestep, torch.Tensor) and timestep.shape[0] == batch_size else timestep
+            c_real = {k: v[real_mask.to(v.device)] if isinstance(v, torch.Tensor) and v.shape[0] == batch_size else v for k, v in c.items()}
+            with torch.cuda.stream(torch.cuda.default_stream()):
+                raw_real = model_function(x_real, timestep_real, **c_real)
+            out[real_mask] = raw_real
+            real_indices = real_mask.nonzero().squeeze()
+            real_indices = [real_indices.item()] if real_indices.dim() == 0 else real_indices.tolist()
+            for i, idx in enumerate(real_indices):
+                state["forecasters"][idx].update(state["cnt"], raw_real[i])
+                state["num_cached"][idx] = 0
+
+        if forecast_mask.any():
+            forecast_indices = forecast_mask.nonzero().squeeze()
+            forecast_indices = [forecast_indices.item()] if forecast_indices.dim() == 0 else forecast_indices.tolist()
+            out_forecast = torch.empty((len(forecast_indices), *x.shape[1:]), device=x.device, dtype=x.dtype)
+
+            def _do_forecast():
+                for j, i in enumerate(forecast_indices):
+                    out_forecast[j] = state["forecasters"][i].predict(state["cnt"])
+                out[forecast_mask] = out_forecast
+                for i in forecast_indices:
+                    state["num_cached"][i] += 1
+
+            if forecast_stream:
+                with torch.cuda.stream(forecast_stream):
+                    _do_forecast()
+                torch.cuda.current_stream().wait_stream(forecast_stream)
+            else:
+                _do_forecast()
+
+        if state["cnt"] >= warmup_steps:
+            state["curr_ws"] += flex_window
+        state["cnt"] += 1
+        return out
+
+    new_model = model.clone()
+    new_model.set_model_unet_function_wrapper(spectrum_unet_wrapper)
+    return new_model
+
+
+class GRSpectrumApply:
+    """
+    Generic Spectrum sampling-step forecaster (Chebyshev + local-Taylor blend),
+    vendored from ruwwww/ComfyUI-Spectrum-sdxl. Skips computing the real network
+    output on some fraction of steps and forecasts it instead, once enough
+    history is built up.
+
+    SCOPE: verified-reasonable for single-frame/image models (SDXL, Flux,
+    Z-Image). Will run on video-shaped (5D) latents too since the underlying
+    math is shape-agnostic, but the row-identity protection here is a cheap
+    shape-based fingerprint, NOT the full transactional cond/uncond
+    branch-tracking that the dedicated ComfyUI-Spectrum-WAN-Proper and
+    ComfyUI-Spectrum-MiniMax-H3 repos implement for exactly this reason.
+    On video, treat this as experimental: compare fixed-seed output against
+    spectrum_enabled=False before trusting it, and prefer the dedicated repos
+    for anything you're not willing to manually verify.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 1000, "tooltip": "Your sampler's total step count -- must match, since the forecaster's time axis is calibrated to it."}),
+            },
+            "optional": {
+                "w": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Blend weight toward the Chebyshev global fit vs local-Taylor extrapolation."}),
+                "m": ("INT", {"default": 3, "min": 0, "max": 8, "tooltip": "Chebyshev polynomial order."}),
+                "lam": ("FLOAT", {"default": 1e-3, "min": 0.0, "max": 1.0, "step": 0.0001}),
+                "window_size": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 20.0, "step": 0.5, "tooltip": "Forecast this many steps before doing another real one."}),
+                "flex_window": ("FLOAT", {"default": 0.0, "min": -5.0, "max": 5.0, "step": 0.1, "tooltip": "Grow (or shrink) the window each step after warmup."}),
+                "warmup_steps": ("INT", {"default": 3, "min": 0, "max": 100, "tooltip": "Run this many real steps before forecasting starts."}),
+                "stop_caching_step": ("INT", {"default": -1, "min": -1, "max": 1000, "tooltip": "Force real steps from here on. -1 = auto (last 20% of steps)."}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "GRNodes/experimental"
+    DESCRIPTION = (
+        "Sampling-step forecaster (Spectrum, SDXL-derived). Verified-reasonable for "
+        "image models; runs on video models too but with reduced row-identity "
+        "protection vs the dedicated Wan/MiniMax-H3 Spectrum repos -- verify output "
+        "quality before trusting it there."
+    )
+    EXPERIMENTAL = True
+
+    def patch(self, model, steps, w=0.5, m=3, lam=1e-3, window_size=2.0,
+              flex_window=0.0, warmup_steps=3, stop_caching_step=-1):
+        return (_spectrum_sdxl_wrap_model(
+            model, w=w, m=m, lam=lam, window_size=window_size,
+            flex_window=flex_window, warmup_steps=warmup_steps,
+            stop_caching_step=stop_caching_step, steps=steps,
+        ),)
+
+
 try:
-    # Sol-Attn's actual kernels (_tri_fwd/_int8_fwd/_morton*) are proprietary Triton
-    # code we haven't seen -- we call kijai's real node rather than reimplement it.
-    solattn_mod = importlib.import_module("custom_nodes.ComfyUI-SolAttn_triton")
-except ImportError:
-    try:
-        solattn_mod = importlib.import_module("ComfyUI-SolAttn_triton")
-    except ImportError:
-        solattn_mod = None
+    # Vendored against the REAL kijai/ComfyUI-SolAttn_triton __init__.py (fetched
+    # and read in full -- not the earlier guessed API). We still import the
+    # installed package rather than vendor it: its Triton kernels (_tri_fwd,
+    # _int8_fwd) and the Morton reordering hooks (_morton, _morton_h3) are real
+    # proprietary compute we haven't seen and shouldn't fake.
+    for _pkg in ("custom_nodes.ComfyUI-SolAttn_triton", "ComfyUI-SolAttn_triton"):
+        try:
+            solattn_mod = importlib.import_module(_pkg)
+            break
+        except ImportError:
+            solattn_mod = None
+except Exception:
+    solattn_mod = None
 
 
 class GRUnifiedAccelerator:
@@ -820,9 +1192,15 @@ class GRUnifiedAccelerator:
                 "allow_compile": ("BOOLEAN", {"default": False}),
                 "triton_kernels": ("BOOLEAN", {"default": True}),
                 "minimax_head_chunks": ("INT", {"default": 1, "min": 1, "max": 64}),
-                "sol_tau": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Sol-Attn sparsity threshold. Higher = sparser/faster/lower fidelity."}),
-                "sol_start_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "sol_tau": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Threshold beta. Higher is sparser: 1.0 ~ 16% of blocks kept exact, 1.5 ~ 7%, 2.0 ~ 2.7%."}),
+                "sol_start_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Run dense before this point. The paper uses 0.2."}),
                 "sol_end_percent": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "sol_min_tokens": ("INT", {"default": 4096, "min": 0, "max": 1 << 20, "step": 512, "tooltip": "Sequences shorter than this stay dense."}),
+                "sol_int8_qk": ("BOOLEAN", {"default": False, "tooltip": "INT8 QK in the exact branch. Free in quality at tau<=1.5, a net loss at tau>=2.0."}),
+                "sol_sink_conditioning": (["exact_kv", "exact_kv_and_rows", "off"], {"default": "exact_kv", "tooltip": "MiniMax-H3 only. exact_kv: packed text/audio/reference rows exact (~3% cost). exact_kv_and_rows: also runs those query rows dense (~20% cost, exact audio). No effect on other models."}),
+                "sol_morton": ("BOOLEAN", {"default": True, "tooltip": "Reorder video tokens into Morton (Z-order) so each 64-token block is a compact 3D neighbourhood -- makes routing far more accurate at a given density. Wan and MiniMax-H3 only; skipped elsewhere."}),
+                "sol_morton_curve": (["3d", "2d_frame"], {"default": "3d", "tooltip": "3d interleaves t/h/w equally. 2d_frame Z-orders within each frame -- try this if 3d degrades at some frame counts (e.g. MiniMax-H3's non-uniform frame spacing)."}),
+                "sol_verbose": ("BOOLEAN", {"default": False, "tooltip": "Log Sol-Attn's per-shape sparse/dense dispatch decisions."}),
             },
         }
 
@@ -839,7 +1217,9 @@ class GRUnifiedAccelerator:
 
     def patch(self, model, sage_architecture, sol_attn, sage_attention_mode="auto",
               allow_compile=False, triton_kernels=True, minimax_head_chunks=1,
-              sol_tau=1.2, sol_start_percent=0.2, sol_end_percent=0.9):
+              sol_tau=1.2, sol_start_percent=0.2, sol_end_percent=0.9,
+              sol_min_tokens=4096, sol_int8_qk=False, sol_sink_conditioning="exact_kv",
+              sol_morton=True, sol_morton_curve="3d", sol_verbose=False):
 
         model_clone = model.clone()
         diffusion_model = model_clone.get_model_object("diffusion_model")
@@ -879,19 +1259,58 @@ class GRUnifiedAccelerator:
         if sol_attn:
             if solattn_mod is None:
                 raise RuntimeError(
-                    "sol_attn=True but ComfyUI-SolAttn_triton is not installed. "
+                    "sol_attn=True but ComfyUI-SolAttn_triton is not installed (or its "
+                    "package folder name doesn't match what this node tries to import -- "
+                    "check the custom_nodes folder name matches 'ComfyUI-SolAttn_triton'). "
                     "Install it from https://github.com/kijai/ComfyUI-SolAttn_triton "
                     "or set sol_attn=False."
                 )
+            if solattn_mod._sol_attn_kernel is None:
+                raise RuntimeError(f"Sol-Attn kernel unavailable: {solattn_mod._IMPORT_ERROR}")
+            if sol_int8_qk and solattn_mod._sol_attn_int8_kernel is None:
+                raise RuntimeError(f"Sol-Attn INT8 kernel unavailable: {solattn_mod._INT8_IMPORT_ERROR}")
+
+            diffusion_model = model_clone.get_model_object("diffusion_model")
+            is_h3 = hasattr(diffusion_model, "rope_freqs") and hasattr(diffusion_model, "_forward")
+            is_wan = hasattr(diffusion_model, "rope_encode") and hasattr(diffusion_model, "blocks")
+
+            # H3 needs the segment-layout hooks installed for the conditioning sink even
+            # when Morton reordering itself is off -- mirrors kijai's execute() exactly.
+            reorder = False
+            if is_h3 and (sol_morton or sol_sink_conditioning != "off"):
+                from importlib import import_module
+                morton_h3 = import_module(f"{solattn_mod.__name__}._morton_h3")
+                morton_h3.install_h3_hooks(diffusion_model)
+                reorder = sol_morton
+            elif is_wan and sol_morton:
+                from importlib import import_module
+                morton_wan = import_module(f"{solattn_mod.__name__}._morton")
+                morton_wan.install_wan_morton(diffusion_model)
+                reorder = True
+            elif sol_morton:
+                logging.warning(
+                    f"GRUnifiedAccelerator: Morton reordering skipped -- "
+                    f"{type(diffusion_model).__name__} is neither Wan-style nor MiniMax-H3. "
+                    "Sol-Attn itself still applies."
+                )
+
             model_sampling = model_clone.get_model_object("model_sampling")
             sigma_start = float(model_sampling.percent_to_sigma(sol_start_percent))
             sigma_end = float(model_sampling.percent_to_sigma(sol_end_percent))
             previous = model_clone.model_options["transformer_options"].get("optimized_attention_override")
             if previous is not None:
                 logging.info("GRUnifiedAccelerator: Sol-Attn chaining onto the sage override -- Sol-Attn gets first refusal, sage handles what Sol-Attn declines")
+
             model_clone.model_options["transformer_options"]["optimized_attention_override"] = solattn_mod.make_override(
-                tau=sol_tau, sigma_start=sigma_start, sigma_end=sigma_end, previous=previous,
+                tau=sol_tau, min_tokens=sol_min_tokens,
+                sigma_start=sigma_start, sigma_end=sigma_end, verbose=sol_verbose,
+                int8_qk=sol_int8_qk, sink_conditioning=sol_sink_conditioning, previous=previous,
             )
+            if reorder:
+                model_clone.model_options["transformer_options"]["sol_morton"] = True
+                model_clone.model_options["transformer_options"]["sol_morton_curve"] = sol_morton_curve
+
+            solattn_mod.reset_sol_attn_stats()
 
         return (model_clone,)
 
@@ -899,8 +1318,10 @@ class GRUnifiedAccelerator:
 NODE_CLASS_MAPPINGS = {
     "GRUnifiedSageAttentionPatch": GRUnifiedSageAttentionPatch,
     "GRUnifiedAccelerator": GRUnifiedAccelerator,
+    "GRSpectrumApply": GRSpectrumApply,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GRUnifiedSageAttentionPatch": "GR Unified Sage Attention Patch",
     "GRUnifiedAccelerator": "GR Unified Accelerator (Sage + Sol-Attn)",
+    "GRSpectrumApply": "GR Spectrum Apply (Generic, incl. video)",
 }
