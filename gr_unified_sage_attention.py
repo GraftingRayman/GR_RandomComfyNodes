@@ -707,9 +707,9 @@ class GRUnifiedSageAttentionPatch:
 
         if architecture == "auto":
             architecture = self._detect_architecture(diffusion_model)
-            logging.info(f"GRUnifiedSageAttentionPatch: auto-detected architecture '{architecture}'")
+            logging.warning(f"GRUnifiedSageAttentionPatch: auto-detected architecture '{architecture}'")
         else:
-            logging.info(f"GRUnifiedSageAttentionPatch: applying '{architecture}' sage attention patch")
+            logging.warning(f"GRUnifiedSageAttentionPatch: applying '{architecture}' sage attention patch")
 
         if architecture == "generic":
             if sage_attention_mode == "disabled":
@@ -944,12 +944,12 @@ class _Spectrum(torch.nn.Module):
         return self.cheb.ready()
 
 
-def _spectrum_sdxl_wrap_model(model, w, m, lam, window_size, flex_window, warmup_steps, stop_caching_step, steps):
+def _spectrum_sdxl_wrap_model(model, w, m, lam, window_size, flex_window, warmup_steps, stop_caching_step, steps, verbose=True):
     """Faithful port of SpectrumSDXL.patch() -- installs a unet_function_wrapper."""
     state = {
         "forecasters": None, "cnt": 0, "num_cached": [0],
         "curr_ws": float(window_size), "last_t": -1, "total_runs": 0,
-        "estimated_total_steps": steps,
+        "estimated_total_steps": steps, "total_real": 0, "total_forecast": 0,
     }
     forecast_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
@@ -974,12 +974,23 @@ def _spectrum_sdxl_wrap_model(model, w, m, lam, window_size, flex_window, warmup
         t_scalar = timestep[0].item() if isinstance(timestep, torch.Tensor) and timestep.numel() > 0 else float(timestep)
 
         if t_scalar > state["last_t"]:
+            if verbose and state["forecasters"] is not None:
+                total = state["total_real"] + state["total_forecast"]
+                pct = 100.0 * state["total_forecast"] / total if total else 0.0
+                logging.warning(
+                    f"[GRSpectrumApply] run #{state['total_runs']} finished: "
+                    f"{state['total_real']} real / {state['total_forecast']} forecast "
+                    f"calls ({pct:.0f}% forecast) -- if this reads 0% forecast, Spectrum "
+                    "never actually kicked in (check warmup_steps vs your total steps)."
+                )
             state["forecasters"] = None
             state["cnt"] = 0
             state["num_cached"] = [0] * batch_size
             state["curr_ws"] = float(window_size)
             state["total_runs"] += 1
             state["fingerprints"] = [None] * batch_size
+            state["total_real"] = 0
+            state["total_forecast"] = 0
         state["last_t"] = t_scalar
 
         if state["forecasters"] is None:
@@ -1080,6 +1091,17 @@ def _spectrum_sdxl_wrap_model(model, w, m, lam, window_size, flex_window, warmup
             else:
                 _do_forecast()
 
+        state["total_real"] += int(real_mask.sum().item())
+        state["total_forecast"] += int(forecast_mask.sum().item())
+        if verbose:
+            real_idx = real_mask.nonzero().flatten().tolist()
+            forecast_idx = forecast_mask.nonzero().flatten().tolist()
+            logging.warning(
+                f"[GRSpectrumApply] step {state['cnt']}/{state['estimated_total_steps']} "
+                f"t={t_scalar:.1f} -- real={real_idx} forecast={forecast_idx} "
+                f"window={state['curr_ws']:.1f}"
+            )
+
         if state["cnt"] >= warmup_steps:
             state["curr_ws"] += flex_window
         state["cnt"] += 1
@@ -1123,6 +1145,7 @@ class GRSpectrumApply:
                 "flex_window": ("FLOAT", {"default": 0.0, "min": -5.0, "max": 5.0, "step": 0.1, "tooltip": "Grow (or shrink) the window each step after warmup."}),
                 "warmup_steps": ("INT", {"default": 3, "min": 0, "max": 100, "tooltip": "Run this many real steps before forecasting starts."}),
                 "stop_caching_step": ("INT", {"default": -1, "min": -1, "max": 1000, "tooltip": "Force real steps from here on. -1 = auto (last 20% of steps)."}),
+                "verbose": ("BOOLEAN", {"default": True, "tooltip": "Log every step's real-vs-forecast decision and a real/forecast summary at the end of each run. Turn off once you've confirmed it's working -- this is chatty."}),
             },
         }
 
@@ -1138,11 +1161,19 @@ class GRSpectrumApply:
     EXPERIMENTAL = True
 
     def patch(self, model, steps, w=0.5, m=3, lam=1e-3, window_size=2.0,
-              flex_window=0.0, warmup_steps=3, stop_caching_step=-1):
+              flex_window=0.0, warmup_steps=3, stop_caching_step=-1, verbose=True):
+        logging.warning(
+            f"[GRSpectrumApply] installed on model -- steps={steps} warmup_steps={warmup_steps} "
+            f"window_size={window_size} flex_window={flex_window} w={w} m={m} "
+            f"stop_caching_step={stop_caching_step} verbose={verbose}. "
+            "This confirms the node RAN and wrapped the model -- it does not yet confirm "
+            "forecasting is happening during sampling; watch for '[GRSpectrumApply] step N/...' "
+            "lines once you queue, and check for 'forecast=[...]' being non-empty."
+        )
         return (_spectrum_sdxl_wrap_model(
             model, w=w, m=m, lam=lam, window_size=window_size,
             flex_window=flex_window, warmup_steps=warmup_steps,
-            stop_caching_step=stop_caching_step, steps=steps,
+            stop_caching_step=stop_caching_step, steps=steps, verbose=verbose,
         ),)
 
 
@@ -1299,7 +1330,7 @@ class GRUnifiedAccelerator:
             sigma_end = float(model_sampling.percent_to_sigma(sol_end_percent))
             previous = model_clone.model_options["transformer_options"].get("optimized_attention_override")
             if previous is not None:
-                logging.info("GRUnifiedAccelerator: Sol-Attn chaining onto the sage override -- Sol-Attn gets first refusal, sage handles what Sol-Attn declines")
+                logging.warning("GRUnifiedAccelerator: Sol-Attn chaining onto the sage override -- Sol-Attn gets first refusal, sage handles what Sol-Attn declines")
 
             model_clone.model_options["transformer_options"]["optimized_attention_override"] = solattn_mod.make_override(
                 tau=sol_tau, min_tokens=sol_min_tokens,
